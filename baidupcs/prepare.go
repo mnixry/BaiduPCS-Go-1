@@ -2,18 +2,19 @@ package baidupcs
 
 import (
 	"bytes"
-	"github.com/json-iterator/go"
-	"github.com/qjfoidnh/BaiduPCS-Go/baidupcs/netdisksign"
-	"github.com/qjfoidnh/BaiduPCS-Go/baidupcs/pcserror"
-	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil/converter"
-	"github.com/qjfoidnh/BaiduPCS-Go/requester/multipartreader"
-	"github.com/qjfoidnh/baidu-tools/tieba"
 	"io"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 	"unsafe"
+
+	jsoniter "github.com/json-iterator/go"
+	"github.com/qjfoidnh/BaiduPCS-Go/baidupcs/netdisksign"
+	"github.com/qjfoidnh/BaiduPCS-Go/baidupcs/pcserror"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil/converter"
+	"github.com/qjfoidnh/BaiduPCS-Go/requester/multipartreader"
+	"github.com/qjfoidnh/baidu-tools/tieba"
 )
 
 type (
@@ -295,6 +296,48 @@ func (pcs *BaiduPCS) PrepareRapidUpload(targetPath, contentMD5, sliceMD5, crc32 
 	return pcs.prepareRapidUpload(targetPath, contentMD5, sliceMD5, crc32, length)
 }
 
+// PrepareRapidUploadV2PreCreate 秒传文件, 新接口, step-1 precreate
+func (pcs *BaiduPCS) PrepareRapidUploadV2PreCreate(targetPath, contentMD5 string, length int64) (dataReadCloser io.ReadCloser, pcsError pcserror.Error) {
+	pcs.lazyInit()
+	pcsURL := pcs.generatePCSURL2("xpan/file", "precreate", nil)
+	post := map[string]string{
+		"path":       targetPath,
+		"size":       strconv.FormatInt(length, 10),
+		"isdir":      "0",
+		"autoinit":   "1",
+		"rtype":      "0",
+		"block_list": mergeStringList(contentMD5),
+	}
+	baiduPCSVerbose.Infof("%s URL: %s, Post: %v\n", OperationRapidUpload, pcsURL, post)
+
+	dataReadCloser, pcsError = pcs.sendReqReturnReadCloser(reqTypePan, OperationRapidUpload, http.MethodPost, pcsURL.String(), post, nil)
+	return
+}
+
+// PrepareRapidUploadV2Create 秒传文件, 新接口, step-2 create
+func (pcs *BaiduPCS) PrepareRapidUploadV2Create(targetPath, contentMD5, uploadid string, length int64) (dataReadCloser io.ReadCloser, pcsError pcserror.Error) {
+	pcs.lazyInit()
+	pcsError = pcs.checkIsdir(OperationRapidUpload, targetPath)
+	if pcsError != nil {
+		return nil, pcsError
+	}
+
+	pcsURL := pcs.generatePCSURL2("xpan/file", "create", nil)
+	post := map[string]string{
+		"path":       targetPath,
+		"size":       strconv.FormatInt(length, 10),
+		"isdir":      "0",
+		"rtype":      "0",
+		"uploadid":   uploadid,
+		"block_list": mergeStringList(contentMD5),
+		"mode":       "1",
+	}
+	baiduPCSVerbose.Infof("%s URL: %s, Post: %v\n", OperationRapidUpload, pcsURL, post)
+
+	dataReadCloser, pcsError = pcs.sendReqReturnReadCloser(reqTypePan, OperationRapidUpload, http.MethodPost, pcsURL.String(), post, nil)
+	return
+}
+
 // PrepareLocateDownload 获取下载链接, 只返回服务器响应数据和错误信息
 func (pcs *BaiduPCS) PrepareLocateDownload(pcspath string) (dataReadCloser io.ReadCloser, pcsError pcserror.Error) {
 	pcs.lazyInit()
@@ -319,22 +362,21 @@ func (pcs *BaiduPCS) PrepareLocateDownload(pcspath string) (dataReadCloser io.Re
 		Path:   "/rest/2.0/pcs/file",
 		RawQuery: (url.Values{
 			"check_blue": []string{"1"},
-			"es": []string{"1"},
-			"esl": []string{"1"},
-			"app_id": []string{PanAppID},
-			"method": []string{"locatedownload"},
-			"path":   []string{pcspath},
-			"ver":    []string{"4.0"},
+			"es":         []string{"1"},
+			"esl":        []string{"1"},
+			"app_id":     []string{PanAppID},
+			"method":     []string{"locatedownload"},
+			"path":       []string{pcspath},
+			"ver":        []string{"4.0"},
 			//"vip":    []string{"2"},
-			"clienttype": []string{"17"},
-			"version": []string{"2.271.76"},
-			"channel": []string{"0"},
+			"clienttype":  []string{"17"},
+			"version":     []string{"2.271.76"},
+			"channel":     []string{"0"},
 			"version_app": []string{"10.1.72"},
-			"apn_id": []string{"1_0"},
-			"freeisp": []string{"0"},
-			"queryfree": []string{"0"},
-			"use": []string{"0"},
-
+			"apn_id":      []string{"1_0"},
+			"freeisp":     []string{"0"},
+			"queryfree":   []string{"0"},
+			"use":         []string{"0"},
 		}).Encode() + "&" + ns.URLParam(),
 	}
 	baiduPCSVerbose.Infof("%s URL: %s\n", OperationLocateDownload, pcsURL)
@@ -371,7 +413,7 @@ func (pcs *BaiduPCS) PrepareLocatePanAPIDownload(fidList ...int64) (dataReadClos
 	return
 }
 
-// PrepareUpload 上传单个文件, 只返回服务器响应数据和错误信息
+// PrepareUpload 上传单个文件, 只返回服务器响应数据和错误信息（分片上传中的预上传部分）
 func (pcs *BaiduPCS) PrepareUpload(policy string, targetPath string, uploadFunc UploadFunc) (dataReadCloser io.ReadCloser, pcsError pcserror.Error) {
 	pcs.lazyInit()
 	pcsError = pcs.checkIsdir(OperationUpload, targetPath)
@@ -614,8 +656,8 @@ func (pcs *BaiduPCS) PrepareSharePSet(paths []string, pwd string, period int) (d
 		"schannel":     "4",
 		"channel_list": "[]",
 		"period":       strconv.Itoa(period),
-		"pwd": pwd,
-		"share_type": "9",
+		"pwd":          pwd,
+		"share_type":   "9",
 	}, map[string]string{
 		"Content-Type": "application/x-www-form-urlencoded",
 	})

@@ -2,10 +2,14 @@ package baidupcs
 
 import (
 	"errors"
-	"github.com/qjfoidnh/BaiduPCS-Go/baidupcs/pcserror"
-	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil/converter"
+	"math/rand"
 	"net/http"
 	"path"
+	"strings"
+	"time"
+
+	"github.com/qjfoidnh/BaiduPCS-Go/baidupcs/pcserror"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil/converter"
 )
 
 const (
@@ -30,6 +34,8 @@ var (
 	ErrUploadSavePathFound = errors.New("unknown response data, file saved path not found")
 	// ErrUploadSeqNotMatch 服务器返回的上传队列不匹配
 	ErrUploadSeqNotMatch = errors.New("服务器返回的上传队列不匹配")
+	// ErrUploadMD5Unknown 服务器无匹配文件/秒传未生效
+	ErrUploadMD5Unknown = errors.New("服务器无匹配文件/秒传未生效")
 )
 
 type (
@@ -82,23 +88,87 @@ type (
 	}
 )
 
+func randomifyMD5(md5 string) string {
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	newmd5bytes := []byte(strings.ToLower(md5))
+	uppermd5 := []byte(strings.ToUpper(md5))
+	for i := range md5 {
+		if r.Float32() > 0.6 {
+			newmd5bytes[i] = uppermd5[i]
+		}
+	}
+	return string(newmd5bytes)
+}
+
 // RapidUpload 秒传文件
 func (pcs *BaiduPCS) RapidUpload(targetPath, contentMD5, sliceMD5, crc32 string, length int64) (pcsError pcserror.Error) {
+	defer func() {
+		if pcsError == nil {
+			// 更新缓存
+			pcs.deleteCache([]string{path.Dir(targetPath)})
+		}
+	}()
+
+	// 尝试全大写
+	pcsError = pcs.rapidUpload(targetPath, strings.ToUpper(contentMD5), strings.ToUpper(sliceMD5), crc32, length)
+	if pcsError == nil || pcsError.GetRemoteErrCode() != 31079 {
+		return
+	}
+
+	// 尝试全小写
+	pcsError = pcs.rapidUpload(targetPath, strings.ToLower(contentMD5), strings.ToLower(sliceMD5), crc32, length)
+	if pcsError == nil || pcsError.GetRemoteErrCode() != 31079 {
+		return
+	}
+
+	// 尝试随机大小写
+	pcsError = pcs.rapidUpload(targetPath, randomifyMD5(contentMD5), randomifyMD5(sliceMD5), crc32, length)
+	if pcsError == nil || pcsError.GetRemoteErrCode() != 31079 {
+		return
+	}
+
+	// 尝试 xpan 接口
+	return pcs.rapidUploadV2(targetPath, strings.ToLower(contentMD5), length)
+}
+
+func (pcs *BaiduPCS) rapidUpload(targetPath, contentMD5, sliceMD5, crc32 string, length int64) (pcsError pcserror.Error) {
 	dataReadCloser, pcsError := pcs.PrepareRapidUpload(targetPath, contentMD5, sliceMD5, crc32, length)
 	if pcsError != nil {
 		return
 	}
+	defer dataReadCloser.Close()
+	return pcserror.DecodePCSJSONError(OperationRapidUpload, dataReadCloser)
+}
 
+func (pcs *BaiduPCS) rapidUploadV2(targetPath, contentMD5 string, length int64) (pcsError pcserror.Error) {
+	dataReadCloser, pcsError := pcs.PrepareRapidUploadV2PreCreate(targetPath, contentMD5, length)
+	if pcsError != nil {
+		return
+	}
 	defer dataReadCloser.Close()
 
-	pcsError = pcserror.DecodePCSJSONError(OperationRapidUpload, dataReadCloser)
+	errInfo := pcserror.NewPanErrorInfo(OperationRapidUpload)
+	jsonData := uploadPrecreateJSON{
+		PanErrorInfo: errInfo,
+	}
+
+	pcsError = pcserror.HandleJSONParse(OperationRapidUpload, dataReadCloser, &jsonData)
 	if pcsError != nil {
 		return
 	}
 
-	// 更新缓存
-	pcs.deleteCache([]string{path.Dir(targetPath)})
-	return nil
+	if jsonData.ReturnType != 1 || len(jsonData.BlockList) != 0 {
+		errInfo.ErrType = pcserror.ErrTypeOthers
+		errInfo.Err = ErrUploadMD5Unknown
+		return errInfo
+	}
+
+	dataReadCloser2, pcsError := pcs.PrepareRapidUploadV2Create(targetPath, contentMD5, jsonData.UploadID, length)
+	if pcsError != nil {
+		return
+	}
+	defer dataReadCloser2.Close()
+	return pcserror.DecodePCSJSONError(OperationRapidUpload, dataReadCloser2)
 }
 
 // RapidUploadNoCheckDir 秒传文件, 不进行目录检查, 会覆盖掉同名的目录!
@@ -119,10 +189,10 @@ func (pcs *BaiduPCS) RapidUploadNoCheckDir(targetPath, contentMD5, sliceMD5, crc
 }
 
 // Upload 上传单个文件
-func (pcs *BaiduPCS) Upload(policy, targetPath string, uploadFunc UploadFunc) (pcsError pcserror.Error) {
+func (pcs *BaiduPCS) Upload(policy, targetPath string, uploadFunc UploadFunc) (pcsError pcserror.Error, newpath string) {
 	dataReadCloser, pcsError := pcs.PrepareUpload(policy, targetPath, uploadFunc)
 	if pcsError != nil {
-		return pcsError
+		return pcsError, ""
 	}
 
 	defer dataReadCloser.Close()
@@ -140,12 +210,12 @@ func (pcs *BaiduPCS) Upload(policy, targetPath string, uploadFunc UploadFunc) (p
 	if jsonData.Path == "" {
 		jsonData.PCSErrInfo.ErrType = pcserror.ErrTypeInternalError
 		jsonData.PCSErrInfo.Err = ErrUploadSavePathFound
-		return jsonData.PCSErrInfo
+		return jsonData.PCSErrInfo, ""
 	}
 
 	// 更新缓存
 	pcs.deleteCache([]string{path.Dir(targetPath)})
-	return nil
+	return nil, jsonData.Path
 }
 
 // UploadTmpFile 分片上传—文件分片及上传
